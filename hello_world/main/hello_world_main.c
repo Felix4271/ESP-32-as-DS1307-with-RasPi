@@ -19,6 +19,8 @@
 #define ACK_VAL                            0x0              /*!< I2C ack value */
 #define NACK_VAL                           0x1              /*!< I2C nack value */
 
+int century = 21;
+
 SemaphoreHandle_t print_mux = NULL;
 
 static uint8_t bcd_to_dec(uint8_t a) {
@@ -28,16 +30,75 @@ static uint8_t bcd_to_dec(uint8_t a) {
 static uint8_t dec_to_bcd(uint8_t a) {
     return ((a/10)<<4) + (a%10);
 }
-/*
-static uint8_t[6] microseconds_to_time(uint32_t a) {
-    uint8_t res[6];
-    uint8_t set[] = {365, 24, 60, 60, 1000}
-    uint8_t b = 1000*60*60*24*365;
-    res[0] = a/b;
-    a%=b;
-    b/=365;
 
-}*/
+typedef struct {
+    uint8_t second;
+    uint8_t minute;
+    uint8_t hour;
+    uint8_t date;
+    uint8_t month;
+    uint8_t year;
+    uint8_t day;
+} __time_t;
+
+static void increment(__time_t prev) {
+    if ((prev.second&0x0F)>=0x09) {
+        if (prev.second>=0x59) {
+            prev.second = 0;
+            if ((prev.minute&0x0F)>=0x09) {
+                if (prev.minute>=0x59) {
+                    prev.minute=0;
+                    if (prev.hour>=0x24) {
+                        prev.date++;
+                        prev.day++;
+                        prev.day%=0x07;
+                        uint8_t month_lengths[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+                        uint8_t month = (prev.month>>4)*10+(prev.month&0x0F);
+                        if (prev.year%4==0&&(prev.year!=00||century%4==1)) {
+                            month_lengths[1] = 29;
+                        }
+                        if (prev.date>=month_lengths[month-1]) {
+                            prev.date=0;
+                            if ((prev.month&0x0F)>=0x09) {
+                                prev.month+=0x07;
+                            } else {
+                                prev.month++;
+                            }
+                            if (prev.month>=0x13) {
+                                prev.month=0;
+                                if ((prev.year&0x0F)>=0x09) {
+                                    prev.year=(prev.year&0xF0)+0x10;
+                                    if (prev.year==0x99) {
+                                        prev.year=0;
+                                        century++;
+                                    }
+                                } else {
+                                    prev.year++;
+                                }
+                            }
+                        } else if ((prev.date&0x0F)>=0x09) {
+                            prev.date=(prev.date&0xF0)+0x10;
+                        } else {
+                            prev.date++;
+                        }
+                    } else if ((prev.hour&0x0F)>=0x09) {
+                        prev.hour=(prev.hour&0xF0)+0x10;
+                    } else {
+                        prev.hour++;
+                    }
+                } else {
+                    prev.minute=(prev.minute&0xF0)+0x10;
+                }
+            } else {
+                prev.minute++;
+            }
+        } else {
+            prev.second=(prev.second&0xF0)+0x10;
+        }
+    } else {
+        prev.second++;
+    }
+}
 
 /**
  * @brief i2c slave initialization
@@ -59,16 +120,8 @@ static void i2c_example_slave_init()
                        I2C_EXAMPLE_SLAVE_TX_BUF_LEN, 0);
 }
 
-static void i2c_test_task(void* arg)
-{
-    while (1) {
-        printf("test cnt: \n");
-        vTaskDelay(( DELAY_TIME_BETWEEN_ITEMS_MS * ( (uint32_t) arg + 1 ) ) / portTICK_RATE_MS);
-    }
-}
-
-void app_main()
-{
+static void talk_to_the_pi() {
+    uint8_t write_buf[512];
     uint8_t* data = (uint8_t*) malloc(512);
     uint8_t* __time = (uint8_t*) malloc(512);
     print_mux = xSemaphoreCreateMutex();
@@ -79,30 +132,59 @@ void app_main()
         __time[i]=0x01;
     }
     int t=0x00;
+    uint8_t cycle_count=0;
+    uint8_t cycle_ptr=0;
+
+    if ( i2c_reset_tx_fifo(I2C_EXAMPLE_SLAVE_NUM) != ESP_OK ) {
+        printf("Failed to reset tx FIFO - I2C loop will not be started!\n");
+        return;
+    }
+
     while (1) {
         size = 0;
         while (size == 0) {
-            size = i2c_slave_read_buffer( I2C_EXAMPLE_SLAVE_NUM, data, DATA_LENGTH, 1000 / portTICK_RATE_MS);
-            printf("NAY\n");
+            size = i2c_slave_read_buffer( I2C_EXAMPLE_SLAVE_NUM, data, 1, 1000 / portTICK_RATE_MS);
         }
-        for (int i=0;i<20;i++) {
-            printf("%d: ", i);
-            printf("%d\n", data[i]);
-        }
-        printf("%d\n",size);
-        if (size==0&&data[0]==0) {
-            size = i2c_slave_read_buffer( I2C_EXAMPLE_SLAVE_NUM, __time, DATA_LENGTH, 1000 / portTICK_RATE_MS);
-            for (int i=0;i<10;i++) {
-                printf("%d", __time[i]);
+        if (size==1) {
+            for (int i=0;i<8;i++) {
+                write_buf[i]=cycle_count;
             }
-            printf("\n");
-        } else if (size==1) {
-            i2c_slave_write_buffer(I2C_EXAMPLE_SLAVE_NUM, __time, 8, 1000 / portTICK_RATE_MS);
+            write_buf[7]=0x06;
+            //if (data[0]==10) {
+            //    write_buf[0]=0;
+            //}
+            if ( i2c_reset_tx_fifo(I2C_EXAMPLE_SLAVE_NUM) != ESP_OK ) {
+                printf("Failed to reset tx FIFO - I2C loop will not be started!\n");
+            }
+            size=i2c_slave_write_buffer(I2C_EXAMPLE_SLAVE_NUM, write_buf, 8, 1000 / portTICK_RATE_MS);
+            if ( size != 8) {
+                printf("WARN: wrong number of bytes written: %d\n", size);
+            }
+            cycle_ptr++;
+            if ( cycle_ptr > 0 ) {
+                cycle_count=(cycle_count%9)+1;
+                cycle_ptr=0;
+            }
         } else {
-            printf("Hmmmmmm......ERRROR%d\n",size);
+            printf("Unexpected read count: %d\n",size);
         }
-        vTaskDelay(1000/portTICK_RATE_MS);
+        // TaskDelay(1000/portTICK_RATE_MS);
     }
+}
+
+static void HZ_pulse() {
+    gpio_set_direction(2, GPIO_MODE_OUTPUT);
+    while (1) {
+        gpio_set_level(2, 1);
+        vTaskDelay(500/portTICK_RATE_MS);
+        gpio_set_level(2, 0);
+        vTaskDelay(500/portTICK_RATE_MS);
+    }
+}
+
+void app_main()
+{
+    xTaskCreate(HZ_pulse, "Task: HZ_pulse", 1024, NULL, 10, NULL);
+    xTaskCreate(talk_to_the_pi, "Task: talk_to_pi", 8192, NULL, 10, NULL);
     fflush(stdout);
-    //xTaskCreate(i2c_test_task, "i2c_test_task_0", 1024 * 2, (void* ) 0, 10, NULL);
 }
